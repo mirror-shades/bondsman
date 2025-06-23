@@ -1,7 +1,7 @@
 .{
-    .name = .para,
+    .name = .bondsman,
     .version = "0.0.0",
-    .fingerprint = 0x24d2942dd6c95ff8,
+    .fingerprint = 0x3b37babc9d18ef6e,
     .minimum_zig_version = "0.14.0",
     .paths = .{
         "build.zig",

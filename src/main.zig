@@ -2,10 +2,12 @@ const std = @import("std");
 const json = std.json;
 const ChildProcess = std.process.Child;
 const windows = std.os.windows;
+const report = @import("reporting.zig");
 
 // Enable ANSI support for Windows console
 fn enableAnsiConsole() !void {
     if (@import("builtin").os.tag == .windows) {
+        _ = std.os.windows.kernel32.SetConsoleOutputCP(65001); // UTF-8
         const handle = try windows.GetStdHandle(windows.STD_OUTPUT_HANDLE);
         var mode: windows.DWORD = undefined;
         if (windows.kernel32.GetConsoleMode(handle, &mode) != 0) {
@@ -215,7 +217,7 @@ const CommandContext = struct {
 
         return try std.fmt.allocPrint(
             self.allocator,
-            "\n{s}{s}{s}{s}$ {s}",
+            "\n{s}ᗹ {s} {s}{s}$ {s}",
             .{
                 status_indicator,
                 colored_basename,
@@ -332,7 +334,7 @@ const CommandHistory = struct {
     pub fn init(allocator: std.mem.Allocator) !Self {
         // Get config directory
         const config_dir = try std.fs.path.join(allocator, &[_][]const u8{
-            try std.fs.getAppDataDir(allocator, "butler"),
+            try std.fs.getAppDataDir(allocator, "bondsman"),
             "history",
         });
 
@@ -469,26 +471,7 @@ fn printError(text: []const u8) void {
 }
 
 fn printWelcome() void {
-    std.debug.print(
-        \\{s}{s}Welcome to Bondsman!{s}
-        \\
-        \\Commands:
-        \\  {s};<text>{s}    Chat with the AI assistant
-        \\  {s}exit{s}       Exit the program
-        \\  {s}help{s}       Show this help message
-        \\
-        \\
-    , .{
-        ANSI.green,
-        ANSI.bold,
-        ANSI.reset,
-        ANSI.cyan,
-        ANSI.reset,
-        ANSI.cyan,
-        ANSI.reset,
-        ANSI.cyan,
-        ANSI.reset,
-    });
+    std.debug.print("run `;;help` for more info", .{});
 }
 
 fn handleChat(client: *std.http.Client, allocator: std.mem.Allocator, prompt: []const u8, context: *const CommandContext, sys_context: *const SystemContext) !void {
@@ -635,8 +618,183 @@ fn handleCommand(allocator: std.mem.Allocator, context: *CommandContext, sys_con
     }
 }
 
-fn preloadModel(client: *std.http.Client, allocator: std.mem.Allocator) !void {
-    std.debug.print("{s}{s}Initializing Bondsman...{s} ", .{
+const OllamaService = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    process: ?ChildProcess,
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return Self{
+            .allocator = allocator,
+            .process = null,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.process) |*proc| {
+            _ = proc.kill() catch {};
+        }
+    }
+
+    pub fn isRunning(self: Self) bool {
+        // Try to connect to Ollama health endpoint
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        const uri = std.Uri.parse("http://localhost:11434/api/tags") catch return false;
+
+        var buf: [1024]u8 = undefined;
+        var request = client.open(.GET, uri, .{
+            .server_header_buffer = &buf,
+        }) catch return false;
+        defer request.deinit();
+
+        request.send() catch return false;
+        request.finish() catch return false;
+        request.wait() catch return false;
+
+        return request.response.status == .ok;
+    }
+
+    pub fn start(self: *Self) !void {
+        if (self.isRunning()) {
+            return; // Already running
+        }
+
+        std.debug.print("{s}{s}Starting Ollama server...{s} ", .{
+            ANSI.yellow,
+            ANSI.bold,
+            ANSI.reset,
+        });
+
+        // Try to start Ollama
+        const argv = &[_][]const u8{ "ollama", "serve" };
+        var child = ChildProcess.init(argv, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+
+        child.spawn() catch |err| switch (err) {
+            error.FileNotFound => {
+                std.debug.print("\r{s}{s}Error: Ollama not found in PATH{s}\n", .{
+                    ANSI.red,
+                    ANSI.bold,
+                    ANSI.reset,
+                });
+                std.debug.print("Please install Ollama: https://ollama.ai/\n", .{});
+                return err;
+            },
+            else => return err,
+        };
+
+        self.process = child;
+
+        // Wait for server to be ready (with timeout)
+        var attempts: u32 = 0;
+        const max_attempts = 30; // 30 seconds total
+
+        while (attempts < max_attempts) {
+            std.time.sleep(1_000_000_000); // 1 second
+            attempts += 1;
+
+            if (self.isRunning()) {
+                std.debug.print("\r{s}{s}Ollama server started!{s}    \n", .{
+                    ANSI.green,
+                    ANSI.bold,
+                    ANSI.reset,
+                });
+                return;
+            }
+
+            // Show progress with animated dots
+            const dots_patterns = [_][]const u8{ "", ".", "..", "..." };
+            const dots = dots_patterns[attempts % 4];
+            std.debug.print("\r{s}{s}Starting Ollama server{s}{s} ", .{
+                ANSI.yellow,
+                ANSI.bold,
+                dots,
+                ANSI.reset,
+            });
+        }
+
+        std.debug.print("\r{s}{s}Error: Ollama server failed to start{s}\n", .{
+            ANSI.red,
+            ANSI.bold,
+            ANSI.reset,
+        });
+        return error.OllamaStartupTimeout;
+    }
+
+    pub fn ensureModelExists(self: Self, model_name: []const u8) !void {
+        // Check if model exists by trying to use it
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        var json_string = std.ArrayList(u8).init(self.allocator);
+        defer json_string.deinit();
+
+        try std.json.stringify(.{
+            .name = model_name,
+        }, .{}, json_string.writer());
+
+        const uri = try std.Uri.parse("http://localhost:11434/api/show");
+        const headers = &[_]std.http.Header{
+            .{ .name = "Content-Type", .value = "application/json" },
+        };
+
+        var buf: [4096]u8 = undefined;
+        var request = client.open(.POST, uri, .{
+            .server_header_buffer = &buf,
+            .extra_headers = headers,
+        }) catch return error.NetworkError;
+        defer request.deinit();
+
+        request.transfer_encoding = .{ .content_length = json_string.items.len };
+        request.send() catch return error.NetworkError;
+        request.writer().writeAll(json_string.items) catch return error.NetworkError;
+        request.finish() catch return error.NetworkError;
+        request.wait() catch return error.NetworkError;
+
+        if (request.response.status != .ok) {
+            std.debug.print("{s}{s}Model '{s}' not found. Downloading...{s}\n", .{
+                ANSI.yellow,
+                ANSI.bold,
+                model_name,
+                ANSI.reset,
+            });
+
+            // Pull the model
+            const pull_argv = &[_][]const u8{ "ollama", "pull", model_name };
+            var pull_child = ChildProcess.init(pull_argv, self.allocator);
+            pull_child.stdin_behavior = .Ignore;
+            pull_child.stdout_behavior = .Inherit;
+            pull_child.stderr_behavior = .Inherit;
+
+            try pull_child.spawn();
+            const term = try pull_child.wait();
+
+            switch (term) {
+                .Exited => |code| {
+                    if (code != 0) {
+                        return error.ModelDownloadFailed;
+                    }
+                },
+                else => return error.ModelDownloadFailed,
+            }
+
+            std.debug.print("{s}{s}Model '{s}' downloaded successfully!{s}\n", .{
+                ANSI.green,
+                ANSI.bold,
+                model_name,
+                ANSI.reset,
+            });
+        }
+    }
+};
+
+fn preloadModel(client: *std.http.Client, allocator: std.mem.Allocator, reporter: *const report.Reporter) !void {
+    reporter.logDebug("{s}{s}Initializing Bondsman...{s} ", .{
         ANSI.yellow,
         ANSI.bold,
         ANSI.reset,
@@ -705,7 +863,7 @@ fn preloadModel(client: *std.http.Client, allocator: std.mem.Allocator) !void {
             defer parsed.deinit();
 
             if (!is_loaded) {
-                std.debug.print("\r{s}{s}Bondsman is ready!{s}      \n\n", .{
+                reporter.logDebug("\r{s}{s}Bondsman is ready!{s}              \n\n", .{
                     ANSI.green,
                     ANSI.bold,
                     ANSI.reset,
@@ -770,14 +928,64 @@ pub fn main() !void {
     // Enable ANSI support for Windows console
     try enableAnsiConsole();
 
+    var debug_enabled = false;
+
     // Create an allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
 
+    // Parse command line arguments
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var auto_start = true;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--no-auto-start")) {
+            auto_start = false;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            std.debug.print(
+                \\Bondsman - Local AI Shell Assistant
+                \\
+                \\Usage: bondsman [options]
+                \\
+                \\Options:
+                \\  --no-auto-start    Don't automatically start Ollama server
+                \\  --help, -h         Show this help message
+                \\
+            , .{});
+            return;
+        }
+        if (std.mem.eql(u8, arg, "--debug")) {
+            debug_enabled = true;
+        }
+    }
+
+    // Initialize reporter
+    var reporter = report.Reporter.init(debug_enabled);
+
     // Initialize system context
     var sys_context = try SystemContext.init(allocator);
     defer sys_context.deinit();
+
+    // Initialize Ollama service manager
+    var ollama = OllamaService.init(allocator);
+    defer ollama.deinit();
+
+    // Start Ollama if needed and ensure model exists
+    if (auto_start) {
+        try ollama.start();
+        try ollama.ensureModelExists("qwen2.5-coder:1.5b");
+    } else {
+        // Just check if it's running
+        if (!ollama.isRunning()) {
+            std.debug.print("{s}{s}Warning: Ollama server not running. Start it with: ollama serve{s}\n", .{
+                ANSI.yellow,
+                ANSI.bold,
+                ANSI.reset,
+            });
+        }
+    }
 
     // Create an HTTP client that we'll reuse
     var client = std.http.Client{ .allocator = allocator };
@@ -793,7 +1001,7 @@ pub fn main() !void {
     defer context.deinit();
 
     // Preload the model
-    try preloadModel(&client, allocator);
+    try preloadModel(&client, allocator, &reporter);
 
     // Show welcome message
     printWelcome();

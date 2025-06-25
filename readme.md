@@ -128,7 +128,7 @@ Uses **qwen2.5-coder:1.5b** by default - a small model (1gb memory and ram) opti
 
 ## Todo
 
-- [ ] `;;` prefix for bondsman-specific commands
+- [x] `;;` prefix for bondsman-specific commands
 - [ ] Tab completion for commands and file paths
 - [ ] Fuzzy search through recent command history
 - [ ] Model switching (`;;model qwen2.5-coder:7b`, `;;model codellama`)

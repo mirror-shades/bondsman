@@ -31,21 +31,6 @@ const ANSI = struct {
     const white = "\x1b[97m";
 };
 
-// Box drawing characters (ASCII)
-const BOX = struct {
-    const top_left = "+";
-    const top_right = "+";
-    const horizontal = "-";
-    const vertical = "|";
-    const bottom_left = "+";
-    const bottom_right = "+";
-};
-
-// Helper function to format text with ANSI colors
-fn colorize(allocator: std.mem.Allocator, color: []const u8, text: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ color, text, ANSI.reset });
-}
-
 const InputMode = enum {
     Command,
     Chat,
@@ -201,6 +186,10 @@ const CommandContext = struct {
         );
     }
 
+    fn colorize(allocator: std.mem.Allocator, color: []const u8, text: []const u8) ![]const u8 {
+        return try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ color, text, ANSI.reset });
+    }
+
     pub fn getPrompt(self: *const Self) ![]const u8 {
         const basename = std.fs.path.basename(self.cwd);
         const status_indicator = if (self.last_status) |status|
@@ -266,27 +255,6 @@ const CommandResult = struct {
         allocator.free(self.output);
         if (self.err_msg) |err| {
             allocator.free(err);
-        }
-    }
-};
-
-const InputHandler = struct {
-    const Self = @This();
-
-    input: []const u8,
-    mode: InputMode,
-
-    pub fn parse(input: []const u8) Self {
-        if (std.mem.startsWith(u8, input, ";")) {
-            return .{
-                .input = std.mem.trim(u8, input[1..], " "),
-                .mode = .Chat,
-            };
-        } else {
-            return .{
-                .input = input,
-                .mode = .Command,
-            };
         }
     }
 };
@@ -471,7 +439,7 @@ fn printError(text: []const u8) void {
 }
 
 fn printWelcome() void {
-    std.debug.print("run `;;help` for more info", .{});
+    std.debug.print("run `;;help` for more info\n", .{});
 }
 
 fn handleChat(client: *std.http.Client, allocator: std.mem.Allocator, prompt: []const u8, context: *const CommandContext, sys_context: *const SystemContext) !void {
@@ -513,7 +481,7 @@ fn handleChat(client: *std.http.Client, allocator: std.mem.Allocator, prompt: []
     defer allocator.free(context_prompt);
 
     try std.json.stringify(.{
-        .model = "qwen2.5-coder:1.5b",
+        .model = MODEL_NAME,
         .prompt = context_prompt,
     }, .{}, json_string.writer());
 
@@ -793,90 +761,6 @@ const OllamaService = struct {
     }
 };
 
-fn preloadModel(client: *std.http.Client, allocator: std.mem.Allocator, reporter: *const report.Reporter) !void {
-    reporter.logDebug("{s}{s}Initializing Bondsman...{s} ", .{
-        ANSI.yellow,
-        ANSI.bold,
-        ANSI.reset,
-    });
-
-    // Create the JSON request body - use a simple prompt
-    var json_string = std.ArrayList(u8).init(allocator);
-    defer json_string.deinit();
-
-    try std.json.stringify(.{
-        .model = "qwen2.5-coder:1.5b",
-        .prompt = "You are a command-line assistant. You help users understand and fix command-line issues. Keep responses concise and focused on command-line usage.",
-    }, .{}, json_string.writer());
-
-    // Parse the URI for Ollama's API endpoint
-    const uri = try std.Uri.parse("http://localhost:11434/api/generate");
-
-    // Set up the headers
-    const headers = &[_]std.http.Header{
-        .{ .name = "Content-Type", .value = "application/json" },
-    };
-
-    // Allocate a buffer for server headers
-    var buf: [4096]u8 = undefined;
-
-    // Make the connection to the server
-    var request = try client.open(.POST, uri, .{
-        .server_header_buffer = &buf,
-        .extra_headers = headers,
-    });
-    defer request.deinit();
-
-    // Set up transfer encoding for sending data
-    request.transfer_encoding = .{ .content_length = json_string.items.len };
-
-    // Send the request headers and body
-    try request.send();
-    try request.writer().writeAll(json_string.items);
-    try request.finish();
-
-    // Wait for the server to send us a response
-    try request.wait();
-
-    // Read and discard the response, but track when we're done
-    const reader = request.reader();
-    var response_buf: [4096]u8 = undefined;
-    var line_buf = std.ArrayList(u8).init(allocator);
-    defer line_buf.deinit();
-
-    var is_loaded = false;
-
-    while (true) {
-        const bytes_read = try reader.read(&response_buf);
-        if (bytes_read == 0) break;
-
-        // Process the chunk of response
-        const chunk = response_buf[0..bytes_read];
-        try line_buf.appendSlice(chunk);
-
-        // Process any complete lines
-        while (std.mem.indexOf(u8, line_buf.items, "\n")) |newline_pos| {
-            const line = line_buf.items[0..newline_pos];
-
-            // Parse the JSON response just to check done status
-            var parsed = try json.parseFromSlice(ResponseChunk, allocator, line, .{ .ignore_unknown_fields = true });
-            defer parsed.deinit();
-
-            if (!is_loaded) {
-                reporter.logDebug("\r{s}{s}Bondsman is ready!{s}              \n\n", .{
-                    ANSI.green,
-                    ANSI.bold,
-                    ANSI.reset,
-                });
-                is_loaded = true;
-            }
-
-            // Remove the processed line from the buffer
-            try line_buf.replaceRange(0, newline_pos + 1, &[_]u8{});
-        }
-    }
-}
-
 fn executeCommand(allocator: std.mem.Allocator, context: *CommandContext, sys_context: *const SystemContext, command: []const u8) !CommandResult {
     // Handle built-in commands first
     if (std.mem.startsWith(u8, command, "cd ")) {
@@ -924,133 +808,200 @@ fn executeCommand(allocator: std.mem.Allocator, context: *CommandContext, sys_co
     return CommandResult.init(allocator, output, status, error_msg);
 }
 
+// Constants
+const MODEL_NAME = "qwen2.5-coder:1.5b";
+
+// Global state for the interface functions
+var g_allocator: std.mem.Allocator = undefined;
+var g_client: std.http.Client = undefined;
+var g_context: CommandContext = undefined;
+var g_sys_context: SystemContext = undefined;
+var g_history: CommandHistory = undefined;
+var g_ollama_initialized = false;
+
+fn ensureOllamaReady() !void {
+    if (g_ollama_initialized) return;
+
+    // Initialize Ollama service manager
+    var ollama = OllamaService.init(g_allocator);
+    defer ollama.deinit();
+
+    // Start Ollama and ensure model exists
+    try ollama.start();
+    try ollama.ensureModelExists(MODEL_NAME);
+
+    // Send init message to preload model
+    std.debug.print("{s}{s}Initializing Bondsman...{s} ", .{
+        ANSI.yellow,
+        ANSI.bold,
+        ANSI.reset,
+    });
+
+    // Create simple init request
+    var json_string = std.ArrayList(u8).init(g_allocator);
+    defer json_string.deinit();
+
+    try std.json.stringify(.{
+        .model = MODEL_NAME,
+        .prompt = "Ready",
+    }, .{}, json_string.writer());
+
+    // Send init request
+    const uri = try std.Uri.parse("http://localhost:11434/api/generate");
+    const headers = &[_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+
+    var buf: [4096]u8 = undefined;
+    var request = try g_client.open(.POST, uri, .{
+        .server_header_buffer = &buf,
+        .extra_headers = headers,
+    });
+    defer request.deinit();
+
+    request.transfer_encoding = .{ .content_length = json_string.items.len };
+    try request.send();
+    try request.writer().writeAll(json_string.items);
+    try request.finish();
+    try request.wait();
+
+    // Discard response to preload model
+    const reader = request.reader();
+    var response_buf: [1024]u8 = undefined;
+    while (true) {
+        const bytes_read = try reader.read(&response_buf);
+        if (bytes_read == 0) break;
+    }
+
+    std.debug.print("\r{s}{s}Bondsman is ready!{s}              \n\n", .{
+        ANSI.green,
+        ANSI.bold,
+        ANSI.reset,
+    });
+
+    g_ollama_initialized = true;
+}
+
+fn internal_command(command: []const u8) void {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+
+    if (std.mem.eql(u8, trimmed, "help")) {
+        printWelcome();
+    } else if (std.mem.eql(u8, trimmed, "quit") or std.mem.eql(u8, trimmed, "exit")) {
+        std.debug.print("\n{s}{s}Goodbye!{s}\n", .{
+            ANSI.green,
+            ANSI.bold,
+            ANSI.reset,
+        });
+        std.process.exit(0);
+    } else {
+        std.debug.print("Unknown internal command: {s}\n", .{trimmed});
+        std.debug.print("Available commands: help, quit, exit\n", .{});
+    }
+}
+
+fn ai_query(query: []const u8) void {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    handleChat(&g_client, g_allocator, trimmed, &g_context, &g_sys_context) catch |err| {
+        printError("Failed to process AI query");
+        std.debug.print("Error: {}\n", .{err});
+    };
+}
+
+fn terminal_command(command: []const u8) void {
+    const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    // Check for quit command at terminal level too
+    if (std.mem.eql(u8, trimmed, "quit") or std.mem.eql(u8, trimmed, "exit")) {
+        std.debug.print("\n{s}{s}Goodbye!{s}\n", .{
+            ANSI.green,
+            ANSI.bold,
+            ANSI.reset,
+        });
+        std.process.exit(0);
+    }
+
+    // Add to history
+    g_history.addCommand(trimmed) catch {};
+
+    // Execute command
+    handleCommand(g_allocator, &g_context, &g_sys_context, trimmed) catch |err| {
+        printError("Failed to execute command");
+        std.debug.print("Error: {}\n", .{err});
+    };
+}
+
 pub fn main() !void {
     // Enable ANSI support for Windows console
     try enableAnsiConsole();
 
-    var debug_enabled = false;
-
     // Create an allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
-    const allocator = gpa.allocator();
+    g_allocator = gpa.allocator();
 
     // Parse command line arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try std.process.argsAlloc(g_allocator);
+    defer std.process.argsFree(g_allocator, args);
 
-    var auto_start = true;
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--no-auto-start")) {
-            auto_start = false;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print(
                 \\Bondsman - Local AI Shell Assistant
                 \\
                 \\Usage: bondsman [options]
                 \\
                 \\Options:
-                \\  --no-auto-start    Don't automatically start Ollama server
                 \\  --help, -h         Show this help message
                 \\
             , .{});
             return;
         }
-        if (std.mem.eql(u8, arg, "--debug")) {
-            debug_enabled = true;
-        }
     }
-
-    // Initialize reporter
-    var reporter = report.Reporter.init(debug_enabled);
 
     // Initialize system context
-    var sys_context = try SystemContext.init(allocator);
-    defer sys_context.deinit();
-
-    // Initialize Ollama service manager
-    var ollama = OllamaService.init(allocator);
-    defer ollama.deinit();
-
-    // Start Ollama if needed and ensure model exists
-    if (auto_start) {
-        try ollama.start();
-        try ollama.ensureModelExists("qwen2.5-coder:1.5b");
-    } else {
-        // Just check if it's running
-        if (!ollama.isRunning()) {
-            std.debug.print("{s}{s}Warning: Ollama server not running. Start it with: ollama serve{s}\n", .{
-                ANSI.yellow,
-                ANSI.bold,
-                ANSI.reset,
-            });
-        }
-    }
+    g_sys_context = try SystemContext.init(g_allocator);
+    defer g_sys_context.deinit();
 
     // Create an HTTP client that we'll reuse
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
+    g_client = std.http.Client{ .allocator = g_allocator };
+    defer g_client.deinit();
 
     // Initialize command history
-    var history = try CommandHistory.init(allocator);
-    defer history.deinit();
-    try history.load();
+    g_history = try CommandHistory.init(g_allocator);
+    defer g_history.deinit();
+    try g_history.load();
 
     // Initialize command context
-    var context = try CommandContext.init(allocator);
-    defer context.deinit();
-
-    // Preload the model
-    try preloadModel(&client, allocator, &reporter);
+    g_context = try CommandContext.init(g_allocator);
+    defer g_context.deinit();
 
     // Show welcome message
     printWelcome();
 
-    // Create a buffer for reading user input
-    var input_buffer: [4096]u8 = undefined;
+    var input: [256]u8 = undefined;
+    const stdin = std.io.getStdIn().reader();
 
     while (true) {
-        // Print context-aware prompt
-        const prompt = try context.getPrompt();
-        defer allocator.free(prompt);
+        // Print context-aware prompt before reading input
+        const prompt = g_context.getPrompt() catch {
+            std.debug.print("$ ", .{});
+            continue;
+        };
+        defer g_allocator.free(prompt);
         std.debug.print("{s}", .{prompt});
 
-        // Read a line of input
-        const stdin = std.io.getStdIn();
-        if (try stdin.reader().readUntilDelimiterOrEof(&input_buffer, '\n')) |user_input| {
-            const trimmed_input = std.mem.trim(u8, user_input, " \t\r\n");
-            if (trimmed_input.len == 0) continue;
-
-            // Check for quit command
-            if (std.mem.eql(u8, trimmed_input, "quit") or std.mem.eql(u8, trimmed_input, "exit")) {
-                std.debug.print("\n{s}{s}Goodbye!{s}\n", .{
-                    ANSI.green,
-                    ANSI.bold,
-                    ANSI.reset,
-                });
-                break;
+        const bytes_read = try stdin.readUntilDelimiter(&input, '\n');
+        if (std.mem.eql(u8, bytes_read[0..1], ";")) {
+            if (std.mem.eql(u8, bytes_read[1..2], ";")) {
+                internal_command(bytes_read[2..]);
+                continue;
             }
-
-            // Parse input mode
-            const handler = InputHandler.parse(trimmed_input);
-
-            switch (handler.mode) {
-                .Chat => {
-                    try handleChat(&client, allocator, handler.input, &context, &sys_context);
-                },
-                .Command => {
-                    try history.addCommand(handler.input);
-                    try handleCommand(allocator, &context, &sys_context, handler.input);
-                },
-            }
+            ai_query(bytes_read[1..]);
         } else {
-            // EOF reached (e.g., Ctrl+D)
-            std.debug.print("\n{s}{s}Goodbye!{s}\n", .{
-                ANSI.green,
-                ANSI.bold,
-                ANSI.reset,
-            });
-            break;
+            terminal_command(bytes_read);
         }
     }
 }

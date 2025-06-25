@@ -52,7 +52,14 @@ const SystemContext = struct {
         defer env.deinit();
 
         // Get shell path from env
-        const shell_path = if (env.get("SHELL")) |sh|
+        // Check for PowerShell first, then fallback to other shells
+        const shell_path = if (env.get("PSModulePath")) |_| blk: {
+            // We're in PowerShell - try to find powershell.exe
+            if (env.get("POWERSHELL_COMMAND")) |ps|
+                break :blk try allocator.dupe(u8, ps)
+            else
+                break :blk try allocator.dupe(u8, "powershell.exe");
+        } else if (env.get("SHELL")) |sh|
             try allocator.dupe(u8, sh)
         else if (env.get("COMSPEC")) |sh|
             try allocator.dupe(u8, sh)
@@ -770,12 +777,21 @@ fn executeCommand(allocator: std.mem.Allocator, context: *CommandContext, sys_co
     }
 
     // Create shell-appropriate command array
-    const argv = if (std.mem.indexOf(u8, sys_context.shell_path, "powershell")) |_|
-        [_][]const u8{ sys_context.shell_path, "-Command", command }
-    else if (std.mem.indexOf(u8, sys_context.shell_path, "cmd")) |_|
-        [_][]const u8{ sys_context.shell_path, "/c", command }
-    else
-        [_][]const u8{ sys_context.shell_path, "-c", command }; // Default to Unix-style
+    var escaped_command: ?[]const u8 = null;
+    defer if (escaped_command) |cmd| allocator.free(cmd);
+
+    const argv = if (std.mem.indexOf(u8, sys_context.shell_path, "powershell")) |_| blk: {
+        // For PowerShell, wrap the command in single quotes to preserve double quotes
+        escaped_command = try std.fmt.allocPrint(allocator, "'{s}'", .{command});
+        break :blk [_][]const u8{ sys_context.shell_path, "-Command", escaped_command.? };
+    } else if (std.mem.indexOf(u8, sys_context.shell_path, "cmd")) |_| blk: {
+        // For CMD.exe, wrap the entire command in quotes to preserve inner quotes
+        escaped_command = try std.fmt.allocPrint(allocator, "\"{s}\"", .{command});
+        break :blk [_][]const u8{ sys_context.shell_path, "/c", escaped_command.? };
+    } else [_][]const u8{ sys_context.shell_path, "-c", command }; // Default to Unix-style
+
+    // DEBUG: Print what we're about to execute
+    std.debug.print("DEBUG: Executing - Shell: '{s}', Arg1: '{s}', Command: '{s}'\n", .{ argv[0], argv[1], argv[2] });
 
     var child = ChildProcess.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
@@ -911,8 +927,14 @@ fn ai_query(query: []const u8) void {
 }
 
 fn terminal_command(command: []const u8) void {
+    // DEBUG: Print the raw command to see what we received
+    std.debug.print("DEBUG: Raw command: '{s}'\n", .{command});
+
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (trimmed.len == 0) return;
+
+    // DEBUG: Print the trimmed command
+    std.debug.print("DEBUG: Trimmed command: '{s}'\n", .{trimmed});
 
     // Check for quit command at terminal level too
     if (std.mem.eql(u8, trimmed, "quit") or std.mem.eql(u8, trimmed, "exit")) {
